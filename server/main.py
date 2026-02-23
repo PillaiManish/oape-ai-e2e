@@ -32,6 +32,8 @@ from sse_starlette.sse import EventSourceResponse
 from vertex_client import VertexClient, ConversationMessage
 from context_loader import load_context, get_available_commands, validate_command
 from tools import TOOL_DEFINITIONS, ToolExecutor
+from agents import Orchestrator
+from agents.tool_adapter import AsyncToolExecutor
 
 # Configure logging
 logging.basicConfig(
@@ -69,6 +71,7 @@ class RunRequest(BaseModel):
     command: str
     prompt: str
     working_dir: str | None = None
+    multi_agent: bool = False  # Use multi-agent orchestration
 
 
 class JobResponse(BaseModel):
@@ -287,6 +290,14 @@ HOMEPAGE_HTML = """
                     placeholder="/path/to/operator-repo">
             </div>
             
+            <div class="form-group">
+                <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer;">
+                    <input type="checkbox" id="multi_agent" name="multi_agent" style="width: auto;">
+                    <span>Multi-Agent Mode</span>
+                    <span style="color: var(--text-muted); font-size: 0.85rem;">(Uses specialized agents: Architect → API Engineer → Controller Engineer → QA → Validator)</span>
+                </label>
+            </div>
+            
             <button type="submit" id="submitBtn">Generate</button>
             <span id="statusBadge" style="margin-left: 1rem;"></span>
         </form>
@@ -306,8 +317,12 @@ HOMEPAGE_HTML = """
             const command = document.getElementById('command').value;
             const prompt = document.getElementById('prompt').value;
             const working_dir = document.getElementById('working_dir').value;
+            const multi_agent = document.getElementById('multi_agent').checked ? '1' : '';
             
             output.textContent = 'Starting...\\n';
+            if (multi_agent) {
+                output.textContent += '🤖 Multi-Agent Mode: Using specialized agents\\n\\n';
+            }
             submitBtn.disabled = true;
             statusBadge.innerHTML = '<span class="status status-running">Running</span>';
             
@@ -316,7 +331,7 @@ HOMEPAGE_HTML = """
                 const res = await fetch('/submit', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                    body: new URLSearchParams({ command, prompt, working_dir })
+                    body: new URLSearchParams({ command, prompt, working_dir, multi_agent })
                 });
                 
                 if (!res.ok) {
@@ -390,6 +405,7 @@ async def submit_job(
     command: str = Form(...),
     prompt: str = Form(...),
     working_dir: str = Form(default=""),
+    multi_agent: str = Form(default=""),
 ):
     """Submit a job to run an OAPE command."""
     # Validate command
@@ -402,6 +418,9 @@ async def submit_job(
     # Validate working directory
     resolved_dir = validate_working_dir(working_dir if working_dir else None)
 
+    # Determine execution mode
+    use_multi_agent = multi_agent in ("1", "true", "on", "yes")
+
     # Create job
     job_id = uuid.uuid4().hex[:12]
     jobs[job_id] = {
@@ -409,6 +428,7 @@ async def submit_job(
         "command": command,
         "prompt": prompt,
         "working_dir": resolved_dir,
+        "multi_agent": use_multi_agent,
         "conversation": [],
         "message_event": asyncio.Condition(),
         "output": "",
@@ -418,7 +438,10 @@ async def submit_job(
     }
 
     # Start background task
-    asyncio.create_task(_run_job(job_id))
+    if use_multi_agent:
+        asyncio.create_task(_run_job_multi_agent(job_id))
+    else:
+        asyncio.create_task(_run_job(job_id))
 
     return JobResponse(job_id=job_id)
 
@@ -559,6 +582,63 @@ async def _run_job(job_id: str):
 
 async def _notify(condition: asyncio.Condition) -> None:
     """Notify waiters on condition."""
+    async with condition:
+        condition.notify_all()
+
+
+async def _run_job_multi_agent(job_id: str):
+    """Execute the job using multi-agent orchestration."""
+    job = jobs[job_id]
+    condition = job["message_event"]
+    loop = asyncio.get_running_loop()
+
+    # Callback for streaming text
+    def stream_callback(text: str) -> None:
+        msg = ConversationMessage(
+            role="assistant",
+            type="text",
+            content=text,
+            tool_name=None,
+        )
+        job["conversation"].append(msg)
+        loop.create_task(_notify(condition))
+
+    try:
+        # Create async tool executor
+        tool_executor = AsyncToolExecutor(job["working_dir"])
+
+        # Create orchestrator
+        orchestrator = Orchestrator(
+            working_dir=job["working_dir"],
+            tool_executor=tool_executor,
+            stream_callback=stream_callback,
+        )
+
+        # Execute the workflow
+        result = await orchestrator.execute(
+            command=job["command"],
+            prompt=job["prompt"],
+            context={"working_dir": job["working_dir"]},
+        )
+
+        # Update job with results
+        job["output"] = f"Workflow: {result.workflow_type.value}\n"
+        job["output"] += f"Agents: {', '.join(result.agents_executed)}\n"
+        job["output"] += f"Total iterations: {result.total_iterations}\n"
+        job["output"] += f"Status: {result.status}\n"
+
+        if result.status == "success":
+            job["status"] = "success"
+        else:
+            job["status"] = "failed"
+            job["error"] = result.error
+
+    except Exception as e:
+        logger.exception("Multi-agent job execution failed")
+        job["status"] = "failed"
+        job["error"] = str(e)
+
+    # Final notification
     async with condition:
         condition.notify_all()
 
