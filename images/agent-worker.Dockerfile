@@ -20,7 +20,7 @@ COPY agent/requirements.txt .
 RUN python3.11 -m pip install --no-cache-dir -r requirements.txt
 
 # Copy server code and config
-COPY agent/agent.py agent/main.py ./
+COPY agent/agent.py agent/main.py agent/ci_monitor.py ./
 
 # copy default config, users willing to customize should mount at runtime.
 COPY deploy/config /config
